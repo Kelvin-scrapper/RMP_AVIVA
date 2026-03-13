@@ -1,702 +1,528 @@
-import undetected_chromedriver as uc
+import os
+import sys
+import io
+import glob
+import time
+import random
+import logging
+import traceback
+import requests
+from datetime import datetime
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, SessionNotCreatedException
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-import time
-import sys
-import io
-import random
-import os
-from datetime import datetime
+from selenium.common.exceptions import TimeoutException
 
 # Fix Unicode encoding for Windows console
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ========== CONFIGURATION ==========
-HEADLESS_MODE = True  # Set to True to run browser in headless mode (hidden)
-# ==================================
+# ============================================================================
+# DIRECTORY SETUP
+# ============================================================================
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+DOWNLOAD_DIR = os.path.join(BASE_DIR, 'downloads')
+LOGS_DIR     = os.path.join(BASE_DIR, 'logs')
 
-def initialize_driver_with_retry(max_attempts=3):
-    """Initialize Chrome driver with automatic version handling and retry logic"""
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR,     exist_ok=True)
 
-    def create_options():
-        """Create fresh ChromeOptions (cannot be reused)"""
-        import os
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        # Get the directory where the script is located
-        download_dir = os.path.dirname(os.path.abspath(__file__))
-
-        options = uc.ChromeOptions()
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-
-        # Enable headless mode if configured
-        if HEADLESS_MODE:
-            options.add_argument('--headless=new')
-            # Additional arguments to make headless mode work better
-            options.add_argument('--disable-gpu')
-            options.add_argument('--window-size=1920,1080')
-            options.add_argument('--disable-web-security')
-            options.add_argument('--disable-features=IsolateOrigins,site-per-process')
-            options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            print("Running in HEADLESS mode (browser hidden)")
-        else:
-            print("Running in VISIBLE mode (browser shown)")
-
-        # Set download preferences to save in script directory and auto-download PDFs
-        prefs = {
-            "download.default_directory": download_dir,
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": True,
-            "plugins.always_open_pdf_externally": True,  # Automatically download PDFs instead of opening in browser
-            "profile.default_content_settings.popups": 0,
-            "profile.default_content_setting_values.automatic_downloads": 1,
-            "profile.content_settings.exceptions.automatic_downloads.*.setting": 1  # Allow automatic downloads
-        }
-        options.add_experimental_option("prefs", prefs)
-
-        print(f"Downloads will be saved to: {download_dir}")
-
-        return options
-
-    # First, try to detect the current Chrome version and use it
-    import re
-    try:
-        print("Attempting to initialize with auto-detected Chrome version...")
-        driver = uc.Chrome(options=create_options(), version_main=None, use_subprocess=True)
-        print("✓ Chrome driver initialized successfully!")
-        return driver
-    except SessionNotCreatedException as e:
-        error_msg = str(e)
-        print(f"✗ Version mismatch detected: {error_msg[:150]}...")
-
-        # Extract version numbers from error
-        if "only supports Chrome version" in error_msg or "Current browser version is" in error_msg:
-            versions = re.findall(r'version (?:is )?(\d+)', error_msg)
-            if len(versions) >= 1:
-                # The last version in the error is usually the current browser version
-                current_version = int(versions[-1])
-                print(f"  Detected browser version: {current_version}")
-                print(f"  Attempting to download matching ChromeDriver version {current_version}...")
-
-                try:
-                    driver = uc.Chrome(
-                        options=create_options(),
-                        version_main=current_version,
-                        use_subprocess=True
-                    )
-                    print("✓ Chrome driver initialized with matching version!")
-                    return driver
-                except Exception as e2:
-                    print(f"✗ Failed with version {current_version}: {str(e2)[:150]}")
-    except Exception as e:
-        print(f"✗ Initial attempt failed: {type(e).__name__}: {str(e)[:150]}")
-
-    # Try alternative strategies
-    strategies = [
-        {'version_main': None, 'use_subprocess': False},
-        {'use_subprocess': True},
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, f'{timestamp}.log'), encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
     ]
+)
 
-    for attempt in range(max_attempts):
-        for strategy_idx, strategy in enumerate(strategies):
-            try:
-                print(f"\nAttempt {attempt + 1}/{max_attempts}, Strategy {strategy_idx + 1}/{len(strategies)}")
-                print(f"  Using strategy: {strategy}")
+# ========== CONFIGURATION ==========
+HEADLESS_MODE = True  # Set to False to show the browser window
+# ====================================
 
-                driver = uc.Chrome(options=create_options(), **strategy)
-                print("✓ Chrome driver initialized successfully!")
-                return driver
+# ============================================================================
+# ASSERTION FUNCTIONS
+# ============================================================================
 
-            except Exception as e:
-                print(f"✗ Failed: {type(e).__name__}: {str(e)[:150]}")
-                if attempt == max_attempts - 1 and strategy_idx == len(strategies) - 1:
-                    raise
-                time.sleep(1)
+def assert_with_log(condition, message):
+    if not condition:
+        logging.error(f"ASSERTION FAILED: {message}")
+        raise AssertionError(message)
 
-    raise Exception("Failed to initialize Chrome driver after all attempts")
+def assert_element_exists(element, element_name, context=""):
+    context_msg = f" in {context}" if context else ""
+    if element is None:
+        msg = f"Element '{element_name}' not found{context_msg}"
+        logging.error(f"ASSERTION FAILED: {msg}")
+        raise AssertionError(msg)
+    return element
+
+def assert_file_exists(filepath, file_description=""):
+    desc = file_description or filepath
+    if not os.path.exists(filepath):
+        msg = f"File not found: {desc} at {filepath}"
+        logging.error(f"ASSERTION FAILED: {msg}")
+        raise AssertionError(msg)
+    logging.info(f"File verified: {desc}")
+    return filepath
+
+def assert_data_not_empty(data, data_name):
+    if not data or len(data) == 0:
+        msg = f"No data found for: {data_name}"
+        logging.error(f"ASSERTION FAILED: {msg}")
+        raise AssertionError(msg)
+    logging.info(f"Data validated: {data_name} contains {len(data)} items")
+    return data
+
+def assert_driver_initialized(driver):
+    assert_with_log(driver is not None, "WebDriver initialized")
+    return driver
+
+# ============================================================================
+# ERROR HELPERS
+# ============================================================================
+
+def save_error_screenshot(driver, error_context=""):
+    if driver:
+        path = os.path.join(LOGS_DIR, f'error_{timestamp}_{error_context}.png')
+        try:
+            driver.save_screenshot(path)
+            logging.error(f"Screenshot saved: {path}")
+            return path
+        except Exception as e:
+            logging.error(f"Failed to save screenshot: {e}")
+    return None
+
+def save_page_source(driver, error_context=""):
+    if driver:
+        path = os.path.join(LOGS_DIR, f'error_{timestamp}_{error_context}.html')
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(driver.page_source)
+            logging.error(f"Page source saved: {path}")
+            return path
+        except Exception as e:
+            logging.error(f"Failed to save page source: {e}")
+    return None
+
+# ============================================================================
+# DRIVER INITIALISATION
+# ============================================================================
+
+def initialize_driver():
+    options = Options()
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+
+    if HEADLESS_MODE:
+        options.add_argument('--headless=new')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-web-security')
+        options.add_argument('--disable-features=IsolateOrigins,site-per-process')
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        logging.info("Running in HEADLESS mode (browser hidden)")
+    else:
+        logging.info("Running in VISIBLE mode (browser shown)")
+
+    prefs = {
+        "download.default_directory":                                   DOWNLOAD_DIR,
+        "download.prompt_for_download":                                 False,
+        "download.directory_upgrade":                                   True,
+        "safebrowsing.enabled":                                         True,
+        "plugins.always_open_pdf_externally":                           True,
+        "profile.default_content_settings.popups":                      0,
+        "profile.default_content_setting_values.automatic_downloads":   1,
+        "profile.content_settings.exceptions.automatic_downloads.*.setting": 1,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    logging.info(f"Downloads will be saved to: {DOWNLOAD_DIR}")
+    logging.info("Initializing ChromeDriver with Selenium Manager...")
+
+    driver = webdriver.Chrome(options=options)
+    assert_driver_initialized(driver)
+
+    if HEADLESS_MODE:
+        driver.command_executor._commands["send_command"] = (
+            "POST", '/session/$sessionId/chromium/send_command'
+        )
+        driver.execute("send_command", {
+            'cmd': 'Page.setDownloadBehavior',
+            'params': {'behavior': 'allow', 'downloadPath': DOWNLOAD_DIR}
+        })
+        logging.info("Enabled downloads in headless mode")
+
+    logging.info("Chrome driver initialized successfully")
+    return driver
+
+# ============================================================================
+# HELPERS
+# ============================================================================
 
 def human_like_scroll(driver, element=None, direction='down'):
-    """Scroll in a human-like manner with random speeds and pauses"""
     try:
         if element:
-            # Scroll to element with smooth behavior
-            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element
+            )
             time.sleep(random.uniform(0.3, 0.7))
         else:
-            # Random scroll amount
             scroll_amount = random.randint(200, 500)
-            if direction == 'down':
-                driver.execute_script(f"window.scrollBy({{top: {scroll_amount}, behavior: 'smooth'}});")
-            else:
-                driver.execute_script(f"window.scrollBy({{top: -{scroll_amount}, behavior: 'smooth'}});")
+            delta = scroll_amount if direction == 'down' else -scroll_amount
+            driver.execute_script(f"window.scrollBy({{top: {delta}, behavior: 'smooth'}});")
             time.sleep(random.uniform(0.5, 1.2))
     except Exception as e:
-        print(f"  ⚠ Scroll error: {str(e)[:100]}")
-
-def random_pause():
-    """Add random human-like pauses"""
-    time.sleep(random.uniform(0.5, 1.5))
+        logging.warning(f"Scroll error: {str(e)[:100]}")
 
 
-def wait_for_download(download_dir, timeout=15, check_interval=0.5):
-    """Wait for download to complete and return the downloaded file path"""
-    import glob
-
-    # Get initial PDF files to ignore
-    initial_pdfs = set(glob.glob(os.path.join(download_dir, "*.pdf")))
-
+def wait_for_download(timeout=15, check_interval=0.5):
+    """Wait for a new PDF to appear in DOWNLOAD_DIR and return its path."""
+    initial_pdfs = set(glob.glob(os.path.join(DOWNLOAD_DIR, "*.pdf")))
     seconds = 0
     while seconds < timeout:
         time.sleep(check_interval)
         seconds += check_interval
-
-        # Look for new PDF files (not .crdownload)
-        current_pdfs = set(glob.glob(os.path.join(download_dir, "*.pdf")))
+        current_pdfs = set(glob.glob(os.path.join(DOWNLOAD_DIR, "*.pdf")))
         new_pdfs = current_pdfs - initial_pdfs
-
         if new_pdfs:
-            # Return the newly downloaded PDF
-            latest_file = max(new_pdfs, key=os.path.getmtime)
-
-            # Wait a bit more to ensure file is fully written
+            latest = max(new_pdfs, key=os.path.getmtime)
             time.sleep(0.5)
-            return latest_file
-
-        # Check if any download is in progress
-        crdownload_files = glob.glob(os.path.join(download_dir, "*.crdownload"))
-        if crdownload_files:
-            # Download is in progress, keep waiting
+            return latest
+        if glob.glob(os.path.join(DOWNLOAD_DIR, "*.crdownload")):
             continue
-
     return None
 
-def get_filename_from_url(driver):
-    """Try to get the original filename from the download or page"""
+# ============================================================================
+# SCRAPING LOGIC
+# ============================================================================
+
+def scrape_aviva_data(driver):
+    url = (
+        "https://www.avivainvestors.com/en-gb/capabilities/fixed-income/"
+        "emerging-markets-local-currency-bond-fund/lu0273498039-eur/"
+    )
+    logging.info(f"Navigating to {url}")
+    driver.get(url)
+
+    logging.info("Waiting for page to load...")
+    time.sleep(2)
+    human_like_scroll(driver, direction='down')
+
+    # ── STEP 1: Accept cookies ────────────────────────────────────────────────
+    logging.info("STEP 1: Accepting cookies")
     try:
-        # Method 1: Check if there's a download attribute or Content-Disposition header
-        script = """
-        // Try to find download links with filename
-        let links = document.querySelectorAll('a[download]');
-        if (links.length > 0) {
-            return links[0].getAttribute('download');
-        }
+        cookie_selectors = [
+            (By.ID, "onetrust-accept-btn-handler"),
+            (By.XPATH, "//button[contains(text(), 'Accept all cookies')]"),
+            (By.XPATH, "//button[contains(text(), 'Accept All')]"),
+        ]
+        short_wait = WebDriverWait(driver, 5)
+        accept_btn = None
+        for by, sel in cookie_selectors:
+            try:
+                accept_btn = short_wait.until(EC.element_to_be_clickable((by, sel)))
+                break
+            except TimeoutException:
+                continue
 
-        // Try to get filename from page title or document title
-        let title = document.title;
-        if (title) {
-            // Clean up title to make it a valid filename
-            return title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        }
-
-        return null;
-        """
-        filename = driver.execute_script(script)
-        return filename
-    except:
-        return None
-
-def scrape_aviva_data():
-    driver = None
-
-    try:
-        # Initialize driver with automatic version handling
-        driver = initialize_driver_with_retry()
-
-        # Enable downloads in headless mode
-        if HEADLESS_MODE:
-            download_dir = os.path.dirname(os.path.abspath(__file__))
-            driver.command_executor._commands["send_command"] = ("POST", '/session/$sessionId/chromium/send_command')
-            params = {
-                'cmd': 'Page.setDownloadBehavior',
-                'params': {
-                    'behavior': 'allow',
-                    'downloadPath': download_dir
-                }
-            }
-            driver.execute("send_command", params)
-            print(f"✓ Enabled downloads in headless mode")
-
-        # Navigate to the URL
-        url = "https://www.avivainvestors.com/en-gb/capabilities/fixed-income/emerging-markets-local-currency-bond-fund/lu0273498039-eur/"
-        print(f"\nNavigating to {url}...")
-        driver.get(url)
-
-        # Wait for page to load
-        print("Waiting for page to load...")
-        time.sleep(2)
-
-        # Initial human-like scroll
-        print("Performing initial page scroll...")
-        human_like_scroll(driver, direction='down')
-
-        # Wait for elements
-        wait = WebDriverWait(driver, 20)
-
-        # STEP 1: Accept All Cookies
-        print("\n=== STEP 1: Accepting All Cookies ===")
-        try:
-            # Try multiple selectors for the Accept All Cookies button
-            cookie_selectors = [
-                (By.ID, "onetrust-accept-btn-handler"),
-                (By.XPATH, "//button[contains(text(), 'Accept all cookies')]"),
-                (By.XPATH, "//button[contains(text(), 'Accept All')]"),
-            ]
-
-            accept_cookies_button = None
-            short_wait = WebDriverWait(driver, 5)
-            for by, selector in cookie_selectors:
-                try:
-                    accept_cookies_button = short_wait.until(
-                        EC.element_to_be_clickable((by, selector))
-                    )
-                    print(f"✓ Found Accept Cookies button")
-                    break
-                except TimeoutException:
-                    continue
-
-            if accept_cookies_button:
-                accept_cookies_button.click()
-                print("✓ Accepted all cookies")
-                time.sleep(0.3)
-            else:
-                print("✗ Could not find Accept Cookies button")
-
-        except Exception as e:
-            print(f"✗ Could not accept cookies: {str(e)[:150]}")
-
-        # STEP 2: Select Intermediary Role
-        print("\n=== STEP 2: Selecting Intermediary Role ===")
-        try:
-            # Wait for role selection to appear
-            time.sleep(1)
-
-            # Try different selectors for the Intermediary option
-            intermediary_selectors = [
-                "//span[contains(text(), 'Intermediary')]/ancestor::label",
-                "//label[contains(., 'Intermediary')]",
-            ]
-
-            intermediary_label = None
-            for selector in intermediary_selectors:
-                try:
-                    intermediary_label = driver.find_element(By.XPATH, selector)
-                    if intermediary_label:
-                        print(f"✓ Found Intermediary label")
-                        break
-                except:
-                    continue
-
-            if intermediary_label:
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", intermediary_label)
-                time.sleep(0.2)
-                driver.execute_script("arguments[0].click();", intermediary_label)
-                print("✓ Clicked Intermediary role")
-                time.sleep(0.5)
-            else:
-                print("✗ Could not find Intermediary role option")
-
-        except Exception as e:
-            print(f"✗ Could not select Intermediary role: {str(e)[:150]}")
-
-        # STEP 3: Enable "Remember me" checkbox
-        print("\n=== STEP 3: Enabling Remember Me Checkbox ===")
-        try:
-            time.sleep(0.5)
-            checkbox = driver.find_element(By.ID, "disclaimer__remember-me")
-
-            if checkbox and checkbox.is_enabled() and not checkbox.is_selected():
-                driver.execute_script("arguments[0].click();", checkbox)
-                print("✓ Checked 'Remember me' checkbox")
-                time.sleep(0.3)
-            else:
-                print("✓ Checkbox already checked or disabled")
-
-        except Exception as e:
-            print(f"✗ Could not handle checkbox: {str(e)[:150]}")
-
-        # STEP 4: Click "I agree" button
-        print("\n=== STEP 4: Clicking I Agree Button ===")
-        try:
-            time.sleep(0.5)
-            agree_button = driver.find_element(By.CSS_SELECTOR, "a.disclaimer__btn.a-button.a-button--primary")
-
-            if agree_button:
-                # Remove disabled state if present
-                driver.execute_script("""
-                    arguments[0].classList.remove('is-disabled');
-                    arguments[0].setAttribute('aria-disabled', 'false');
-                """, agree_button)
-
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", agree_button)
-                time.sleep(0.2)
-                driver.execute_script("arguments[0].click();", agree_button)
-                print("✓ Clicked I agree button")
-                time.sleep(3)  # Wait for page content to load after disclaimer
-            else:
-                print("✗ Could not find I agree button")
-
-        except Exception as e:
-            print(f"✗ Could not click I agree button: {str(e)[:150]}")
-
-        print("\n=== Navigation Complete ===")
-        print(f"Current URL: {driver.current_url}")
-
-        # Scroll down to load content
-        print("Scrolling to load documents...")
-        for _ in range(4):
-            driver.execute_script("window.scrollBy(0, 400);")
+        if accept_btn:
+            accept_btn.click()
+            logging.info("Accepted all cookies")
             time.sleep(0.3)
+        else:
+            logging.warning("Accept Cookies button not found — may not be shown")
+    except Exception as e:
+        logging.warning(f"Could not accept cookies: {str(e)[:150]}")
 
-        # STEP 5: Find and download documents from table
-        print("\n=== STEP 5: Downloading Documents ===")
-        try:
-            # Wait for the document table to load
-            time.sleep(4)
+    # ── STEP 2: Select Intermediary role ─────────────────────────────────────
+    logging.info("STEP 2: Selecting Intermediary role")
+    try:
+        time.sleep(1)
+        intermediary_selectors = [
+            "//span[contains(text(), 'Intermediary')]/ancestor::label",
+            "//label[contains(., 'Intermediary')]",
+        ]
+        intermediary_label = None
+        for sel in intermediary_selectors:
+            try:
+                intermediary_label = driver.find_element(By.XPATH, sel)
+                if intermediary_label:
+                    break
+            except Exception:
+                continue
 
-            # Find all table rows with document data
-            # Looking for rows with the specific structure: td with header matching documentName
-            document_rows = driver.find_elements(
-                By.XPATH,
-                "//td[@headers and contains(@headers, 'documentName')]/ancestor::tr[contains(@class, 'ec-table__row')]"
+        if intermediary_label:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", intermediary_label
             )
+            time.sleep(0.2)
+            driver.execute_script("arguments[0].click();", intermediary_label)
+            logging.info("Clicked Intermediary role")
+            time.sleep(0.5)
+        else:
+            logging.warning("Intermediary role option not found")
+    except Exception as e:
+        logging.warning(f"Could not select Intermediary role: {str(e)[:150]}")
 
-            if not document_rows:
-                # Try alternative selector
-                document_rows = driver.find_elements(
-                    By.XPATH,
-                    "//td[contains(@class, 'ec-table__cell') and @data-title='Document name']/ancestor::tr"
-                )
+    # ── STEP 3: Remember me checkbox ─────────────────────────────────────────
+    logging.info("STEP 3: Enabling Remember Me checkbox")
+    try:
+        time.sleep(0.5)
+        checkbox = driver.find_element(By.ID, "disclaimer__remember-me")
+        if checkbox and checkbox.is_enabled() and not checkbox.is_selected():
+            driver.execute_script("arguments[0].click();", checkbox)
+            logging.info("Checked 'Remember me' checkbox")
+            time.sleep(0.3)
+        else:
+            logging.info("Checkbox already checked or disabled")
+    except Exception as e:
+        logging.warning(f"Could not handle checkbox: {str(e)[:150]}")
 
-            print(f"✓ Found {len(document_rows)} document row(s)")
+    # ── STEP 4: I Agree ───────────────────────────────────────────────────────
+    logging.info("STEP 4: Clicking I Agree button")
+    try:
+        time.sleep(0.5)
+        agree_btn = driver.find_element(
+            By.CSS_SELECTOR, "a.disclaimer__btn.a-button.a-button--primary"
+        )
+        driver.execute_script("""
+            arguments[0].classList.remove('is-disabled');
+            arguments[0].setAttribute('aria-disabled', 'false');
+        """, agree_btn)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", agree_btn)
+        time.sleep(0.2)
+        driver.execute_script("arguments[0].click();", agree_btn)
+        logging.info("Clicked I Agree button")
+        time.sleep(3)
+    except Exception as e:
+        logging.warning(f"Could not click I Agree button: {str(e)[:150]}")
 
-            downloaded_count = 0
-            download_dir = os.path.dirname(os.path.abspath(__file__))
+    logging.info(f"Current URL after navigation: {driver.current_url}")
 
-            for idx, row in enumerate(document_rows, 1):
+    # Scroll to load lazy content
+    for _ in range(4):
+        driver.execute_script("window.scrollBy(0, 400);")
+        time.sleep(0.3)
+
+    # ── STEP 5: Scroll to Documents section & collect cards ───────────────────
+    logging.info("STEP 5: Locating document cards")
+    time.sleep(2)
+
+    # Scroll all the way down so lazy-loaded document cards render
+    logging.info("Scrolling page to load document cards...")
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    for _ in range(10):
+        driver.execute_script("window.scrollBy(0, 600);")
+        time.sleep(0.4)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+    time.sleep(2)
+
+    # The page uses card-based layout: <li class="download-card ...">
+    #   <a class="download-card__link" href="https://doc.morningstar.com/...msdoc?...">
+    #     <h3 class="download-card__file-name">Fund factsheet</h3>
+    #   </a>
+    # </li>
+    all_cards = driver.find_elements(By.CSS_SELECTOR, "li.download-card")
+    logging.info(f"Found {len(all_cards)} download card(s) total")
+    assert_data_not_empty(all_cards, "download cards")
+
+    # Filter to only Fund factsheet cards
+    target_cards = []
+    for card in all_cards:
+        try:
+            name_el = card.find_element(By.CSS_SELECTOR, "h3.download-card__file-name")
+            if "Fund factsheet" in name_el.text:
+                link_el  = card.find_element(By.CSS_SELECTOR, "a.download-card__link")
+                doc_url  = link_el.get_attribute("href")
                 try:
-                    # Get document name from the first cell
-                    doc_name_cell = row.find_element(By.XPATH, ".//div[contains(@class, 'ec-table__cell-content')]")
-                    doc_name = doc_name_cell.text.strip()
+                    date_el  = card.find_element(By.CSS_SELECTOR, "span.file-info__count")
+                    doc_date = date_el.text.strip()
+                except Exception:
+                    doc_date = "N/A"
+                target_cards.append((name_el.text.strip(), doc_date, doc_url))
+        except Exception:
+            continue
 
-                    # Only download from "Fund factsheet" section
-                    if "Fund factsheet" not in doc_name:
-                        print(f"\n  Skipping {idx}: {doc_name} (not Fund factsheet)")
-                        continue
+    logging.info(f"Found {len(target_cards)} 'Fund factsheet' card(s)")
+    assert_data_not_empty(target_cards, "Fund factsheet cards")
 
-                    # Get date if available
-                    try:
-                        date_cell = row.find_element(By.XPATH, ".//td[@data-title='Date']//div[@class='ec-table__cell-content']")
-                        doc_date = date_cell.text.strip()
-                    except:
-                        doc_date = "N/A"
+    # Build a requests session using Selenium's cookies so Morningstar
+    # recognises us as a valid Aviva Investors referrer.
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": driver.current_url,
+    })
+    for cookie in driver.get_cookies():
+        session.cookies.set(cookie["name"], cookie["value"])
 
-                    print(f"\n  Document {idx}: {doc_name} (Date: {doc_date})")
+    downloaded_count = 0
 
-                    # Find the download button in this row
-                    download_button = row.find_element(By.XPATH, ".//button[@type='button']")
+    for idx, (doc_name, doc_date, doc_url) in enumerate(target_cards, 1):
+        logging.info(f"Document {idx}: '{doc_name}' | Date: {doc_date} | URL: {doc_url}")
 
-                    # Human-like scroll to the button
-                    human_like_scroll(driver, download_button)
-                    time.sleep(0.3)
+        try:
+            # Step A: Fetch the .msdoc viewer page
+            resp = session.get(doc_url, timeout=30, allow_redirects=True)
+            logging.info(f"msdoc response: {resp.status_code} | Content-Type: {resp.headers.get('Content-Type','?')}")
 
-                    # Store current window handles before clicking
-                    original_window = driver.current_window_handle
-                    original_windows = driver.window_handles
+            content_type = resp.headers.get("Content-Type", "")
 
-                    # Get initial PDF count before clicking
-                    import glob
-                    initial_pdfs = set(glob.glob(os.path.join(download_dir, "*.pdf")))
+            if "application/pdf" in content_type or resp.url.endswith(".pdf"):
+                # Morningstar redirected straight to the PDF
+                pdf_bytes = resp.content
+                pdf_url_final = resp.url
+            else:
+                # HTML viewer — parse for the embedded PDF URL
+                import re
+                pdf_url_final = None
 
-                    # Click the download button
-                    try:
-                        download_button.click()
-                        print(f"  ✓ Clicked download button for: {doc_name}")
-                    except Exception as e:
-                        print(f"  Regular click failed, trying JavaScript click")
-                        driver.execute_script("arguments[0].click();", download_button)
-                        print(f"  ✓ Clicked download button for: {doc_name} (via JavaScript)")
+                # Pattern 1: look for a direct .pdf href or src
+                match = re.search(
+                    r'(?:src|href|data)=["\']([^"\']+\.pdf[^"\']*)["\']',
+                    resp.text, re.IGNORECASE
+                )
+                if match:
+                    pdf_url_final = match.group(1)
+                    if pdf_url_final.startswith("//"):
+                        pdf_url_final = "https:" + pdf_url_final
 
-                    # Wait for new tab to potentially open or download to start
-                    time.sleep(0.5)
+                # Pattern 2: look for a "url" JSON key pointing to a PDF
+                if not pdf_url_final:
+                    match = re.search(
+                        r'"url"\s*:\s*"([^"]+\.pdf[^"]*)"',
+                        resp.text, re.IGNORECASE
+                    )
+                    if match:
+                        pdf_url_final = match.group(1).replace("\\u0026", "&")
 
-                    # Check if a new tab opened
-                    new_windows = driver.window_handles
-                    if len(new_windows) > len(original_windows):
-                        print(f"  ✓ New tab detected, switching to it...")
-                        # Switch to the new tab
-                        new_window = [w for w in new_windows if w not in original_windows][0]
-                        driver.switch_to.window(new_window)
+                # Pattern 3: Morningstar sometimes uses /document/.../download endpoint
+                if not pdf_url_final:
+                    hash_match = re.search(
+                        r'/document/([a-f0-9]+)\.msdoc', doc_url
+                    )
+                    if hash_match:
+                        doc_hash = hash_match.group(1)
+                        pdf_url_final = (
+                            f"https://doc.morningstar.com/document/{doc_hash}.pdf"
+                            f"?clientId=avivainvestors&key=0011b526a18a80ef"
+                        )
+                        logging.info(f"Constructed direct PDF URL: {pdf_url_final}")
 
-                        # Wait for the PDF to load in the new tab
-                        print(f"  ✓ Waiting for document to load in new tab...")
-                        time.sleep(1)
-
-                        current_url = driver.current_url
-                        print(f"  📄 New tab URL: {current_url}")
-
-                        # Human-like scroll in the new tab
-                        human_like_scroll(driver, direction='down')
-                        time.sleep(0.3)
-
-                        # Check if it's a direct PDF or opened in Chrome's PDF viewer
-                        if '.msdoc' in current_url or 'morningstar.com/document' in current_url:
-                            print(f"  ✓ Morningstar document viewer detected")
-                            # Wait for the viewer to load fully
-                            time.sleep(1)
-
-                            # Try to extract the direct PDF URL from the page
-                            try:
-                                pdf_url_script = """
-                                // Try to find the embedded PDF URL
-                                let pdfUrl = null;
-
-                                // Method 1: Check for embed element with PDF src
-                                let embeds = document.querySelectorAll('embed[type="application/pdf"]');
-                                if (embeds.length > 0) {
-                                    pdfUrl = embeds[0].src;
-                                }
-
-                                // Method 2: Check for iframe with PDF
-                                if (!pdfUrl) {
-                                    let iframes = document.querySelectorAll('iframe');
-                                    for (let iframe of iframes) {
-                                        if (iframe.src && (iframe.src.includes('.pdf') || iframe.src.includes('pdf'))) {
-                                            pdfUrl = iframe.src;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Method 3: Look for object tags
-                                if (!pdfUrl) {
-                                    let objects = document.querySelectorAll('object[type="application/pdf"]');
-                                    if (objects.length > 0) {
-                                        pdfUrl = objects[0].data;
-                                    }
-                                }
-
-                                // Method 4: Check if current page itself is a PDF
-                                if (!pdfUrl && document.contentType === 'application/pdf') {
-                                    pdfUrl = window.location.href;
-                                }
-
-                                return pdfUrl;
-                                """
-
-                                pdf_url = driver.execute_script(pdf_url_script)
-                                print(f"  📋 Extracted PDF URL: {pdf_url}")
-
-                                if pdf_url and pdf_url != current_url:
-                                    print(f"  ✓ Found direct PDF URL, navigating to it for download...")
-                                    driver.get(pdf_url)
-                                    time.sleep(2)  # Wait for download to start
-                                    print(f"  ✓ PDF download initiated")
-                                else:
-                                    print(f"  ⚠ Could not extract PDF URL, waiting for auto-download...")
-                                    time.sleep(2)  # Wait for auto-download with plugins.always_open_pdf_externally
-
-                            except Exception as extract_error:
-                                print(f"  ⚠ PDF extraction failed: {str(extract_error)[:100]}")
-
-                            # Switch to the PDF viewer's iframe or shadow DOM context
-                            # The Chrome PDF viewer has a download button in its toolbar
-                            try:
-                                # Try to click the download button in Chrome's PDF viewer
-                                # The download button is in the PDF viewer's shadow DOM
-                                print(f"  ⚠ Attempting to click Chrome PDF viewer download button...")
-
-                                # Use JavaScript to find and click the download button in Shadow DOM
-                                download_script = """
-                                // Access Chrome PDF viewer's shadow DOM
-                                try {
-                                    // Method 1: Try to find the PDF viewer embed element
-                                    let pdfViewer = document.querySelector('embed[type="application/pdf"]');
-                                    if (pdfViewer) {
-                                        // Look for the toolbar in parent elements
-                                        let toolbar = pdfViewer.parentElement.querySelector('pdf-viewer-toolbar');
-                                        if (toolbar && toolbar.shadowRoot) {
-                                            let downloadBtn = toolbar.shadowRoot.querySelector('#download');
-                                            if (downloadBtn) {
-                                                downloadBtn.click();
-                                                return 'clicked_shadow';
-                                            }
-                                        }
-                                    }
-
-                                    // Method 2: Try direct selectors
-                                    let downloadButton = document.querySelector('cr-icon-button#download');
-                                    if (downloadButton) {
-                                        downloadButton.click();
-                                        return 'clicked_direct';
-                                    }
-
-                                    // Method 3: Look for download icon
-                                    downloadButton = document.querySelector('button[aria-label*="Download"]');
-                                    if (downloadButton) {
-                                        downloadButton.click();
-                                        return 'clicked_aria';
-                                    }
-
-                                    // Method 4: Look in all shadow roots
-                                    let allElements = document.querySelectorAll('*');
-                                    for (let el of allElements) {
-                                        if (el.shadowRoot) {
-                                            let btn = el.shadowRoot.querySelector('button[title*="Download"], cr-icon-button#download, [aria-label*="Download"]');
-                                            if (btn) {
-                                                btn.click();
-                                                return 'clicked_shadow_scan';
-                                            }
-                                        }
-                                    }
-
-                                    return 'not_found';
-                                } catch (e) {
-                                    return 'error: ' + e.message;
-                                }
-                                """
-
-                                result = driver.execute_script(download_script)
-                                print(f"  📋 JavaScript result: {result}")
-
-                                if 'clicked' in str(result):
-                                    print(f"  ✓ Clicked download button via JavaScript ({result})")
-                                    time.sleep(1)
-                                else:
-                                    print(f"  ⚠ Download button not found ({result})")
-
-                            except Exception as js_error:
-                                print(f"  ⚠ JavaScript method failed: {str(js_error)[:100]}")
-
-                        elif current_url.endswith('.pdf'):
-                            print(f"  ✓ Direct PDF URL detected")
-                            # Direct PDF should auto-download
-                            time.sleep(2)
-                        else:
-                            # Try to find a download link/button in the page
-                            print(f"  ⚠ Looking for download elements in page...")
-                            try:
-                                download_selectors = [
-                                    (By.XPATH, "//a[contains(@download, '')]"),
-                                    (By.XPATH, "//a[contains(text(), 'Download')]"),
-                                    (By.XPATH, "//button[contains(text(), 'Download')]"),
-                                    (By.CSS_SELECTOR, "a[download]"),
-                                ]
-
-                                download_link = None
-                                for by, selector in download_selectors:
-                                    try:
-                                        download_link = driver.find_element(by, selector)
-                                        print(f"  ✓ Found download element: {selector}")
-                                        download_link.click()
-                                        print(f"  ✓ Clicked download element")
-                                        time.sleep(2)
-                                        break
-                                    except:
-                                        continue
-
-                                if not download_link:
-                                    print(f"  ⚠ No download button found")
-                            except Exception as dl_error:
-                                print(f"  ⚠ Could not trigger download: {str(dl_error)[:100]}")
-
-                        # Close the new tab
-                        driver.close()
-                        print(f"  ✓ Closed new tab")
-
-                        # Switch back to original window
-                        driver.switch_to.window(original_window)
-                        print(f"  ✓ Switched back to original tab")
-                    else:
-                        print(f"  ✓ Document download initiated (no new tab)")
-
-                    # Wait for the download to complete
-                    print(f"  ⏳ Waiting for download to complete...")
-
-                    # Check for new PDFs
-                    time.sleep(1.5)  # Give download a moment to start/complete
-                    current_pdfs = set(glob.glob(os.path.join(download_dir, "*.pdf")))
-                    new_pdfs = current_pdfs - initial_pdfs
-
-                    if new_pdfs:
-                        downloaded_file = max(new_pdfs, key=os.path.getmtime)
-                        print(f"  ✓ Downloaded: {os.path.basename(downloaded_file)}")
-                        file_size = os.path.getsize(downloaded_file) / 1024  # Size in KB
-                        print(f"  📊 File size: {file_size:.2f} KB")
-                    else:
-                        # If not found yet, use wait function
-                        downloaded_file = wait_for_download(download_dir, timeout=8)
-                        if downloaded_file:
-                            print(f"  ✓ Downloaded: {os.path.basename(downloaded_file)}")
-                            file_size = os.path.getsize(downloaded_file) / 1024  # Size in KB
-                            print(f"  📊 File size: {file_size:.2f} KB")
-                        else:
-                            print(f"  ⚠ Download may still be in progress or failed")
-
-                    downloaded_count += 1
-                    time.sleep(0.5)
-
-                except Exception as e:
-                    print(f"  ✗ Could not download document {idx}: {str(e)[:150]}")
-                    # Make sure we're back on the original window
-                    try:
-                        driver.switch_to.window(original_window)
-                    except:
-                        pass
+                if not pdf_url_final:
+                    logging.error(f"Could not find PDF URL in msdoc page for: {doc_name}")
                     continue
 
-            print(f"\n✓ Successfully processed {downloaded_count} document(s)")
+                logging.info(f"Fetching PDF from: {pdf_url_final}")
+                pdf_resp = session.get(pdf_url_final, timeout=60, allow_redirects=True)
+                logging.info(
+                    f"PDF response: {pdf_resp.status_code} | "
+                    f"Content-Type: {pdf_resp.headers.get('Content-Type','?')} | "
+                    f"Size: {len(pdf_resp.content)//1024} KB"
+                )
+                if pdf_resp.status_code != 200:
+                    logging.error(f"Failed to download PDF: HTTP {pdf_resp.status_code}")
+                    continue
+                pdf_bytes = pdf_resp.content
 
-            # Final check of all downloaded files
-            import glob
-            pdf_files = glob.glob(os.path.join(download_dir, "*.pdf"))
+            # Save the PDF
+            safe_name = doc_name.replace(" ", "_").replace("/", "-")
+            safe_date = doc_date.replace("/", "-")
+            filename   = f"{safe_name}_{safe_date}.pdf"
+            save_path  = os.path.join(DOWNLOAD_DIR, filename)
 
-            if pdf_files:
-                print(f"\n✓ All downloaded files in {download_dir}:")
-                for pdf in pdf_files:
-                    file_size = os.path.getsize(pdf) / 1024  # Size in KB
-                    print(f"  - {os.path.basename(pdf)} ({file_size:.2f} KB)")
-            else:
-                print(f"\n⚠ No PDF files found in {download_dir}")
+            with open(save_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            size_kb = len(pdf_bytes) / 1024
+            logging.info(f"Saved: {filename} ({size_kb:.2f} KB)")
+            assert_file_exists(save_path, filename)
+            downloaded_count += 1
 
         except Exception as e:
-            print(f"✗ Could not download documents: {str(e)[:150]}")
+            logging.error(f"Error downloading '{doc_name}': {str(e)[:200]}")
+
+    logging.info(f"Successfully downloaded {downloaded_count} / {len(target_cards)} document(s)")
+
+    # Final summary
+    pdf_files = glob.glob(os.path.join(DOWNLOAD_DIR, "*.pdf"))
+    if pdf_files:
+        logging.info(f"Files in {DOWNLOAD_DIR}:")
+        for pdf in pdf_files:
+            size_kb = os.path.getsize(pdf) / 1024
+            logging.info(f"  - {os.path.basename(pdf)} ({size_kb:.2f} KB)")
+    else:
+        logging.warning(f"No PDF files found in {DOWNLOAD_DIR}")
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    driver = None
+    try:
+        logging.info("=" * 60)
+        logging.info(f"AVIVA DATA EXTRACTION PIPELINE — {timestamp}")
+        logging.info(f"Python {sys.version}")
+        logging.info("=" * 60)
+
+        driver = initialize_driver()
+        scrape_aviva_data(driver)
+
+        logging.info("=" * 60)
+        logging.info("SCRIPT COMPLETED SUCCESSFULLY")
+        logging.info("=" * 60)
+        return 0
+
+    except AssertionError as e:
+        logging.error("=" * 60)
+        logging.error("ASSERTION FAILED")
+        logging.error(f"Error: {e}")
+        logging.error("=" * 60)
+        save_error_screenshot(driver, "assertion_failure")
+        save_page_source(driver, "assertion_failure")
+        return 1
 
     except Exception as e:
-        print(f"\n❌ Error occurred: {type(e).__name__}")
-        print(f"Details: {e}")
-
-        import traceback
-        print("\nFull traceback:")
-        traceback.print_exc()
-
-        if driver:
-            try:
-                print(f"\nCurrent URL when error occurred: {driver.current_url}")
-            except:
-                pass
+        logging.error("=" * 60)
+        logging.error("UNEXPECTED ERROR")
+        logging.error(f"Type: {type(e).__name__}")
+        logging.error(f"Message: {e}")
+        logging.error("=" * 60)
+        logging.error(traceback.format_exc())
+        save_error_screenshot(driver, "unexpected_error")
+        save_page_source(driver, "unexpected_error")
+        return 1
 
     finally:
         if driver:
             try:
                 driver.quit()
-                print("\n✓ Browser closed")
+                logging.info("Browser closed successfully")
             except Exception as e:
-                print(f"Error closing browser: {e}")
+                logging.warning(f"Error closing browser: {e}")
+
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("Aviva Investors Scraper")
-    print("=" * 70)
-    print(f"Python version: {sys.version}")
-    print(f"Platform: {sys.platform}")
-    print("=" * 70 + "\n")
-
-    scrape_aviva_data()
+    sys.exit(main())
